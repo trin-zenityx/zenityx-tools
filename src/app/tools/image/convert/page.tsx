@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import PageShell from "@/components/PageShell";
 import JSZip from "jszip";
-import { saveAs } from "file-saver";
 import {
   bytesToSize,
   canvasToBlob,
@@ -37,6 +36,15 @@ function makeId() {
 function getOutputName(file: File, format: ConvertFormat) {
   const base = file.name.replace(/\.[^.]+$/, "");
   return `${base}.${format.toLowerCase()}`;
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 
 export default function ConvertPage() {
@@ -154,7 +162,7 @@ export default function ConvertPage() {
       }
     });
     const blob = await zip.generateAsync({ type: "blob" });
-    saveAs(blob, `zenityx-convert-${Date.now()}.zip`);
+    downloadBlob(blob, `zenityx-convert-${Date.now()}.zip`);
   };
 
   const canDownloadAll = items.length > 1 && items.every((item) => item.status === "done");

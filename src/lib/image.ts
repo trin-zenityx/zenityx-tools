@@ -1,5 +1,3 @@
-import heic2any from "heic2any";
-
 export type LoadedImage = {
   image: HTMLImageElement;
   sourceBlob: Blob;
@@ -35,6 +33,7 @@ async function loadImageFromUrl(url: string) {
 }
 
 async function normalizeHeicBlob(blob: Blob) {
+  const { default: heic2any } = await import("heic2any");
   const result = await heic2any({
     blob,
     toType: "image/jpeg",
