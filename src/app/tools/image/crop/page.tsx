@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Cropper from "react-easy-crop";
 import PageShell from "@/components/PageShell";
+import { fileToImage, getCroppedImage, isHeicFile } from "@/lib/image";
 
 const ratioOptions = [
   { label: "อิสระ", value: "free" },
@@ -12,101 +14,76 @@ const ratioOptions = [
 ];
 
 function parseRatio(value: string) {
-  if (value === "free") return null;
+  if (value === "free") return undefined;
   const [w, h] = value.split(":").map(Number);
-  return w && h ? w / h : null;
-}
-
-async function loadImageFromFile(file: File) {
-  const url = URL.createObjectURL(file);
-  try {
-    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const image = new Image();
-      image.onload = () => resolve(image);
-      image.onerror = reject;
-      image.src = url;
-    });
-    return img;
-  } finally {
-    URL.revokeObjectURL(url);
-  }
+  return w && h ? w / h : undefined;
 }
 
 export default function CropPage() {
   const [file, setFile] = useState<File | null>(null);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   const [ratio, setRatio] = useState("free");
+  const [crop, setCrop] = useState({ x: 0, y: 0 });
+  const [zoom, setZoom] = useState(1);
+  const [croppedAreaPixels, setCroppedAreaPixels] = useState<{
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null>(null);
   const [status, setStatus] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
-      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      if (imageUrl) URL.revokeObjectURL(imageUrl);
       if (resultUrl) URL.revokeObjectURL(resultUrl);
     };
-  }, [previewUrl, resultUrl]);
+  }, [imageUrl, resultUrl]);
 
-  const handleFile = (nextFile: File | null) => {
+  const handleFile = async (nextFile: File | null) => {
     setFile(nextFile);
     setStatus(null);
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    if (imageUrl) URL.revokeObjectURL(imageUrl);
     if (resultUrl) URL.revokeObjectURL(resultUrl);
     setResultUrl(null);
-    if (nextFile) {
-      setPreviewUrl(URL.createObjectURL(nextFile));
+
+    if (!nextFile) {
+      setImageUrl(null);
+      return;
+    }
+
+    if (isHeicFile(nextFile)) {
+      const { url } = await fileToImage(nextFile);
+      setImageUrl(url);
     } else {
-      setPreviewUrl(null);
+      setImageUrl(URL.createObjectURL(nextFile));
     }
   };
 
   const handleCrop = async () => {
-    if (!file) return;
+    if (!file || !imageUrl || !croppedAreaPixels) return;
     setStatus("กำลังครอบภาพ...");
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     try {
-      const image = await loadImageFromFile(file);
-      const targetRatio = parseRatio(ratio);
-
-      let sx = 0;
-      let sy = 0;
-      let sw = image.width;
-      let sh = image.height;
-
-      if (targetRatio) {
-        const currentRatio = image.width / image.height;
-        if (currentRatio > targetRatio) {
-          sw = image.height * targetRatio;
-          sx = (image.width - sw) / 2;
-        } else {
-          sh = image.width / targetRatio;
-          sy = (image.height - sh) / 2;
-        }
-      }
-
-      const canvas = document.createElement("canvas");
-      canvas.width = sw;
-      canvas.height = sh;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) throw new Error("Canvas ไม่พร้อมใช้งาน");
-      ctx.drawImage(image, sx, sy, sw, sh, 0, 0, sw, sh);
-
-      const blob = await new Promise<Blob | null>((resolve) =>
-        canvas.toBlob(resolve, "image/jpeg", 0.92)
-      );
-      if (!blob) throw new Error("ไม่สามารถสร้างไฟล์ใหม่ได้");
-
+      const { url } = await getCroppedImage(imageUrl, croppedAreaPixels);
       if (resultUrl) URL.revokeObjectURL(resultUrl);
-      setResultUrl(URL.createObjectURL(blob));
+      setResultUrl(url);
       setStatus("ครอบภาพสำเร็จ");
     } catch {
       setStatus("เกิดข้อผิดพลาดในการครอบภาพ");
     }
   };
 
+  const resetCrop = () => {
+    setCrop({ x: 0, y: 0 });
+    setZoom(1);
+  };
+
   return (
     <PageShell
       title="ครอบภาพ"
-      description="เลือกสัดส่วนที่ต้องการแล้วครอบภาพได้ทันที รองรับโหมดอิสระ"
+      description="ลากเพื่อเลือกกรอบครอป ซูม/แพนได้ พร้อมสัดส่วนมาตรฐาน"
       breadcrumbs={[
         { label: "หน้าแรก", href: "/" },
         { label: "รูปภาพ", href: "/tools/image" },
@@ -120,10 +97,10 @@ export default function CropPage() {
             id="file"
             className="input"
             type="file"
-            accept="image/*"
+            accept="image/*,.heic,.heif"
             onChange={(event) => handleFile(event.target.files?.[0] ?? null)}
           />
-          <span className="helper">รองรับไฟล์ PNG, JPG, WEBP</span>
+          <span className="helper">รองรับไฟล์ PNG, JPG, WEBP, HEIC</span>
 
           <label htmlFor="ratio">อัตราส่วน</label>
           <select
@@ -139,23 +116,47 @@ export default function CropPage() {
             ))}
           </select>
 
-          <button className="btn primary" type="button" onClick={handleCrop}>
-            ครอบภาพ
-          </button>
+          <div className="slider">
+            <label htmlFor="zoom">ซูม ({zoom.toFixed(2)}x)</label>
+            <input
+              id="zoom"
+              type="range"
+              min={1}
+              max={3}
+              step={0.05}
+              value={zoom}
+              onChange={(event) => setZoom(Number(event.target.value))}
+            />
+          </div>
+
+          <div className="cta-row">
+            <button className="btn secondary" type="button" onClick={resetCrop}>
+              รีเซ็ต
+            </button>
+            <button className="btn primary" type="button" onClick={handleCrop}>
+              ครอบภาพ
+            </button>
+          </div>
           {status ? <span className="helper">{status}</span> : null}
         </div>
 
         <div className="form-panel">
           <h3>พื้นที่ครอบ</h3>
-          <div className="preview">
-            {resultUrl ? (
-              <img src={resultUrl} alt="ภาพที่ครอบแล้ว" />
-            ) : previewUrl ? (
-              <img src={previewUrl} alt="ตัวอย่างไฟล์" />
-            ) : (
-              "Crop Preview"
-            )}
-          </div>
+          {imageUrl ? (
+            <div className="cropper-shell">
+              <Cropper
+                image={imageUrl}
+                crop={crop}
+                zoom={zoom}
+                aspect={parseRatio(ratio)}
+                onCropChange={setCrop}
+                onZoomChange={setZoom}
+                onCropComplete={(_, croppedPixels) => setCroppedAreaPixels(croppedPixels)}
+              />
+            </div>
+          ) : (
+            <div className="preview">Crop Preview</div>
+          )}
           {resultUrl ? (
             <a className="btn secondary" href={resultUrl} download="zenityx-crop.jpg">
               ดาวน์โหลดไฟล์

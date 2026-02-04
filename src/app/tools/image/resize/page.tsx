@@ -2,27 +2,21 @@
 
 import { useEffect, useState } from "react";
 import PageShell from "@/components/PageShell";
+import { fileToImage, isHeicFile } from "@/lib/image";
 
-async function loadImageFromFile(file: File) {
-  const url = URL.createObjectURL(file);
-  try {
-    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const image = new Image();
-      image.onload = () => resolve(image);
-      image.onerror = reject;
-      image.src = url;
-    });
-    return img;
-  } finally {
-    URL.revokeObjectURL(url);
-  }
-}
+const presets = [
+  { label: "Instagram Square 1080x1080", w: 1080, h: 1080 },
+  { label: "Instagram Portrait 1080x1350", w: 1080, h: 1350 },
+  { label: "YouTube 1920x1080", w: 1920, h: 1080 }
+];
 
 export default function ResizePage() {
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   const [lock, setLock] = useState(true);
+  const [usePercent, setUsePercent] = useState(false);
+  const [percent, setPercent] = useState(100);
   const [width, setWidth] = useState<number | "">("");
   const [height, setHeight] = useState<number | "">("");
   const [origin, setOrigin] = useState<{ w: number; h: number } | null>(null);
@@ -48,11 +42,22 @@ export default function ResizePage() {
       setHeight("");
       return;
     }
+
+    if (isHeicFile(nextFile)) {
+      const { url, image } = await fileToImage(nextFile);
+      setPreviewUrl(url);
+      setOrigin({ w: image.width, h: image.height });
+      setWidth(image.width);
+      setHeight(image.height);
+      return;
+    }
+
     setPreviewUrl(URL.createObjectURL(nextFile));
-    const img = await loadImageFromFile(nextFile);
-    setOrigin({ w: img.width, h: img.height });
-    setWidth(img.width);
-    setHeight(img.height);
+    const { image, revoke } = await fileToImage(nextFile);
+    setOrigin({ w: image.width, h: image.height });
+    setWidth(image.width);
+    setHeight(image.height);
+    revoke();
   };
 
   const handleWidthChange = (value: number) => {
@@ -76,7 +81,7 @@ export default function ResizePage() {
     setStatus("กำลังปรับขนาด...");
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     try {
-      const image = await loadImageFromFile(file);
+      const { image } = await fileToImage(file);
       const canvas = document.createElement("canvas");
       canvas.width = width;
       canvas.height = height;
@@ -95,10 +100,28 @@ export default function ResizePage() {
     }
   };
 
+  const handlePreset = (value: string) => {
+    if (value === "") return;
+    const [w, h] = value.split("x").map(Number);
+    if (w && h) {
+      setWidth(w);
+      setHeight(h);
+      setUsePercent(false);
+    }
+  };
+
+  const handlePercentChange = (value: number) => {
+    setPercent(value);
+    if (origin) {
+      setWidth(Math.round((origin.w * value) / 100));
+      setHeight(Math.round((origin.h * value) / 100));
+    }
+  };
+
   return (
     <PageShell
       title="ย่อ/ขยายภาพ"
-      description="กำหนดขนาดใหม่ของภาพ พร้อมล็อกสัดส่วนอัตโนมัติ"
+      description="กำหนดขนาดใหม่ของภาพ พร้อมล็อกสัดส่วนอัตโนมัติและ preset ยอดนิยม"
       breadcrumbs={[
         { label: "หน้าแรก", href: "/" },
         { label: "รูปภาพ", href: "/tools/image" },
@@ -112,42 +135,80 @@ export default function ResizePage() {
             id="file"
             className="input"
             type="file"
-            accept="image/*"
+            accept="image/*,.heic,.heif"
             onChange={(event) => handleFile(event.target.files?.[0] ?? null)}
           />
-          <span className="helper">รองรับไฟล์ PNG, JPG, WEBP</span>
+          <span className="helper">รองรับไฟล์ PNG, JPG, WEBP, HEIC</span>
 
-          <label htmlFor="width">ความกว้าง (px)</label>
-          <input
-            id="width"
-            className="input"
-            type="number"
-            value={width}
-            onChange={(event) => {
-              const value = event.target.value;
-              if (value === "") {
-                setWidth("");
-                return;
-              }
-              handleWidthChange(Number(value));
-            }}
-          />
+          <label htmlFor="preset">Preset ขนาดยอดนิยม</label>
+          <select id="preset" className="input" onChange={(event) => handlePreset(event.target.value)}>
+            <option value="">เลือก preset</option>
+            {presets.map((preset) => (
+              <option key={preset.label} value={`${preset.w}x${preset.h}`}>
+                {preset.label}
+              </option>
+            ))}
+          </select>
 
-          <label htmlFor="height">ความสูง (px)</label>
-          <input
-            id="height"
+          <label htmlFor="percent">ปรับแบบเปอร์เซ็นต์</label>
+          <select
+            id="percent"
             className="input"
-            type="number"
-            value={height}
-            onChange={(event) => {
-              const value = event.target.value;
-              if (value === "") {
-                setHeight("");
-                return;
-              }
-              handleHeightChange(Number(value));
-            }}
-          />
+            value={usePercent ? "percent" : "custom"}
+            onChange={(event) => setUsePercent(event.target.value === "percent")}
+          >
+            <option value="custom">กำหนดเอง</option>
+            <option value="percent">ใช้เปอร์เซ็นต์</option>
+          </select>
+
+          {usePercent ? (
+            <div className="slider">
+              <label htmlFor="percent-value">เปอร์เซ็นต์ ({percent}%)</label>
+              <input
+                id="percent-value"
+                type="range"
+                min={10}
+                max={200}
+                step={5}
+                value={percent}
+                onChange={(event) => handlePercentChange(Number(event.target.value))}
+              />
+            </div>
+          ) : (
+            <>
+              <label htmlFor="width">ความกว้าง (px)</label>
+              <input
+                id="width"
+                className="input"
+                type="number"
+                value={width}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  if (value === "") {
+                    setWidth("");
+                    return;
+                  }
+                  handleWidthChange(Number(value));
+                }}
+              />
+
+              <label htmlFor="height">ความสูง (px)</label>
+              <input
+                id="height"
+                className="input"
+                type="number"
+                value={height}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  if (value === "") {
+                    setHeight("");
+                    return;
+                  }
+                  handleHeightChange(Number(value));
+                }}
+              />
+            </>
+          )}
 
           <label htmlFor="lock">ล็อกสัดส่วน</label>
           <select

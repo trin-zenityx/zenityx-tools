@@ -1,120 +1,191 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import PageShell from "@/components/PageShell";
+import JSZip from "jszip";
+import { saveAs } from "file-saver";
+import { bytesToSize, canvasToBlob, fileToImage } from "@/lib/image";
 
 type OptimizeFormat = "JPG" | "WEBP";
+
+type OptimizeItem = {
+  id: string;
+  file: File;
+  status: "idle" | "working" | "done" | "error";
+  message?: string;
+  outputUrl?: string;
+  outputBlob?: Blob;
+  outputSize?: number;
+  previewUrl?: string;
+};
 
 const formatToMime: Record<OptimizeFormat, string> = {
   JPG: "image/jpeg",
   WEBP: "image/webp"
 };
 
-function bytesToSize(bytes: number) {
-  if (!bytes) return "0 KB";
-  const units = ["B", "KB", "MB"];
-  const idx = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  const value = bytes / Math.pow(1024, idx);
-  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[idx]}`;
+function makeId() {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-async function loadImageFromFile(file: File) {
-  const url = URL.createObjectURL(file);
-  try {
-    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const image = new Image();
-      image.onload = () => resolve(image);
-      image.onerror = reject;
-      image.src = url;
-    });
-    return img;
-  } finally {
-    URL.revokeObjectURL(url);
-  }
-}
-
-async function encodeCanvas(canvas: HTMLCanvasElement, mime: string, quality: number) {
-  return new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, mime, quality));
+function getOutputName(file: File, format: OptimizeFormat) {
+  const base = file.name.replace(/\.[^.]+$/, "");
+  return `${base}.${format.toLowerCase()}`;
 }
 
 export default function OptimizePage() {
-  const [file, setFile] = useState<File | null>(null);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [resultUrl, setResultUrl] = useState<string | null>(null);
-  const [resultSize, setResultSize] = useState<number | null>(null);
+  const [items, setItems] = useState<OptimizeItem[]>([]);
   const [format, setFormat] = useState<OptimizeFormat>("JPG");
   const [quality, setQuality] = useState(80);
   const [targetSize, setTargetSize] = useState<number | "">("");
   const [status, setStatus] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [isWorking, setIsWorking] = useState(false);
+  const itemsRef = useRef<OptimizeItem[]>([]);
 
-  const originalSize = useMemo(() => (file ? bytesToSize(file.size) : "-") , [file]);
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
 
-  const handleFile = (nextFile: File | null) => {
-    setFile(nextFile);
-    setStatus(null);
-    setResultUrl(null);
-    setResultSize(null);
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    if (nextFile) {
-      setPreviewUrl(URL.createObjectURL(nextFile));
-    } else {
-      setPreviewUrl(null);
+  useEffect(() => {
+    return () => {
+      itemsRef.current.forEach((item) => {
+        if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+        if (item.outputUrl) URL.revokeObjectURL(item.outputUrl);
+      });
+    };
+  }, []);
+
+  const originalSize = useMemo(() => {
+    const file = items.find((item) => item.id === selectedId)?.file;
+    return file ? bytesToSize(file.size) : "-";
+  }, [items, selectedId]);
+
+  const selectedItem = useMemo(
+    () => items.find((item) => item.id === selectedId) ?? null,
+    [items, selectedId]
+  );
+
+  const handleFiles = async (files: FileList | null) => {
+    items.forEach((item) => {
+      if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+      if (item.outputUrl) URL.revokeObjectURL(item.outputUrl);
+    });
+
+    if (!files || files.length === 0) {
+      setItems([]);
+      setSelectedId(null);
+      setStatus(null);
+      return;
     }
+
+    const nextItems: OptimizeItem[] = [];
+    for (const file of Array.from(files)) {
+      let previewUrl: string | undefined;
+      if (file.type === "image/heic" || file.type === "image/heif" || file.name.toLowerCase().endsWith(".heic") || file.name.toLowerCase().endsWith(".heif")) {
+        const { url } = await fileToImage(file);
+        previewUrl = url;
+      } else {
+        previewUrl = URL.createObjectURL(file);
+      }
+      nextItems.push({
+        id: makeId(),
+        file,
+        status: "idle",
+        previewUrl
+      });
+    }
+
+    setItems(nextItems);
+    setSelectedId(nextItems[0].id);
+    setStatus(null);
+  };
+
+  const updateItem = (id: string, patch: Partial<OptimizeItem>) => {
+    setItems((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
   };
 
   const handleOptimize = async () => {
-    if (!file) return;
+    if (items.length === 0) return;
+    setIsWorking(true);
     setStatus("กำลังบีบอัดภาพ...");
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-    try {
-      const image = await loadImageFromFile(file);
-      const canvas = document.createElement("canvas");
-      canvas.width = image.width;
-      canvas.height = image.height;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) throw new Error("Canvas ไม่พร้อมใช้งาน");
-      ctx.drawImage(image, 0, 0);
 
-      const mime = formatToMime[format];
-      const targetBytes = targetSize ? Number(targetSize) * 1024 : null;
-      let selectedQuality = quality / 100;
-      let blob: Blob | null = null;
+    for (const item of items) {
+      updateItem(item.id, { status: "working", message: "กำลังบีบอัด" });
+      try {
+        const { image, revoke } = await fileToImage(item.file);
+        const canvas = document.createElement("canvas");
+        canvas.width = image.width;
+        canvas.height = image.height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("Canvas ไม่พร้อมใช้งาน");
+        ctx.drawImage(image, 0, 0);
 
-      if (targetBytes && mime !== "image/png") {
-        let low = 0.3;
-        let high = 0.95;
-        for (let i = 0; i < 6; i += 1) {
-          const mid = (low + high) / 2;
-          const testBlob = await encodeCanvas(canvas, mime, mid);
-          if (!testBlob) continue;
-          if (testBlob.size > targetBytes) {
-            high = mid;
-          } else {
-            low = mid;
-            blob = testBlob;
+        const mime = formatToMime[format];
+        const targetBytes = targetSize ? Number(targetSize) * 1024 : null;
+        let selectedQuality = quality / 100;
+        let blob: Blob | null = null;
+
+        if (targetBytes) {
+          let low = 0.3;
+          let high = 0.95;
+          for (let i = 0; i < 6; i += 1) {
+            const mid = (low + high) / 2;
+            const testBlob = await canvasToBlob(canvas, mime, mid);
+            if (!testBlob) continue;
+            if (testBlob.size > targetBytes) {
+              high = mid;
+            } else {
+              low = mid;
+              blob = testBlob;
+            }
           }
+          selectedQuality = low;
+          if (!blob) blob = await canvasToBlob(canvas, mime, selectedQuality);
+        } else {
+          blob = await canvasToBlob(canvas, mime, selectedQuality);
         }
-        selectedQuality = low;
-        if (!blob) blob = await encodeCanvas(canvas, mime, selectedQuality);
-      } else {
-        blob = await encodeCanvas(canvas, mime, selectedQuality);
-      }
 
-      if (!blob) throw new Error("ไม่สามารถสร้างไฟล์ใหม่ได้");
-      if (resultUrl) URL.revokeObjectURL(resultUrl);
-      const url = URL.createObjectURL(blob);
-      setResultUrl(url);
-      setResultSize(blob.size);
-      setStatus(`บีบอัดเสร็จแล้ว (คุณภาพ ${Math.round(selectedQuality * 100)}%)`);
-    } catch {
-      setStatus("เกิดข้อผิดพลาดในการบีบอัดภาพ");
+        if (!blob) throw new Error("ไม่สามารถสร้างไฟล์ใหม่ได้");
+        if (item.outputUrl) URL.revokeObjectURL(item.outputUrl);
+        const url = URL.createObjectURL(blob);
+        updateItem(item.id, {
+          status: "done",
+          message: `เสร็จแล้ว (${Math.round(selectedQuality * 100)}%)`,
+          outputUrl: url,
+          outputBlob: blob,
+          outputSize: blob.size
+        });
+        revoke();
+      } catch {
+        updateItem(item.id, { status: "error", message: "บีบอัดไม่สำเร็จ" });
+      }
     }
+
+    setStatus("บีบอัดเสร็จแล้ว");
+    setIsWorking(false);
   };
+
+  const handleDownloadAll = async () => {
+    const completed = items.filter((item) => item.outputBlob);
+    if (completed.length === 0) return;
+    const zip = new JSZip();
+    completed.forEach((item) => {
+      if (item.outputBlob) {
+        zip.file(getOutputName(item.file, format), item.outputBlob);
+      }
+    });
+    const blob = await zip.generateAsync({ type: "blob" });
+    saveAs(blob, `zenityx-optimize-${Date.now()}.zip`);
+  };
+
+  const canDownloadAll = items.length > 1 && items.every((item) => item.status === "done");
 
   return (
     <PageShell
       title="บีบอัดภาพ"
-      description="ลดขนาดไฟล์ให้เหมาะกับเว็บ โดยยังคงคุณภาพภาพที่ดี"
+      description="ลดขนาดไฟล์ให้เหมาะกับเว็บ รองรับหลายไฟล์และกำหนดขนาดเป้าหมาย"
       breadcrumbs={[
         { label: "หน้าแรก", href: "/" },
         { label: "รูปภาพ", href: "/tools/image" },
@@ -128,10 +199,11 @@ export default function OptimizePage() {
             id="file"
             className="input"
             type="file"
-            accept="image/*"
-            onChange={(event) => handleFile(event.target.files?.[0] ?? null)}
+            accept="image/*,.heic,.heif"
+            multiple
+            onChange={(event) => handleFiles(event.target.files)}
           />
-          <span className="helper">รองรับไฟล์ PNG, JPG, WEBP</span>
+          <span className="helper">รองรับไฟล์ PNG, JPG, WEBP, HEIC (เลือกหลายไฟล์ได้)</span>
 
           <label htmlFor="format">ฟอร์แมตปลายทาง</label>
           <select
@@ -172,29 +244,61 @@ export default function OptimizePage() {
             }}
           />
 
-          <button className="btn primary" type="button" onClick={handleOptimize}>
-            บีบอัดภาพ
+          <button className="btn primary" type="button" onClick={handleOptimize} disabled={isWorking}>
+            {isWorking ? "กำลังบีบอัด..." : "บีบอัดภาพ"}
           </button>
           {status ? <span className="helper">{status}</span> : null}
         </div>
 
         <div className="form-panel">
+          <h3>ไฟล์ที่เลือก</h3>
+          <div className="list">
+            {items.length === 0 ? (
+              <span className="helper">ยังไม่มีไฟล์</span>
+            ) : (
+              items.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={`list-item ${selectedId === item.id ? "active" : ""}`}
+                  onClick={() => setSelectedId(item.id)}
+                >
+                  <div>
+                    <strong>{item.file.name}</strong>
+                    <div className="helper">{bytesToSize(item.file.size)}</div>
+                  </div>
+                  <span className={`chip ${item.status}`}>{item.message ?? "รอ"}</span>
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="grid" style={{ marginTop: 24 }}>
+        <div className="form-panel">
           <h3>ตัวอย่างผลลัพธ์</h3>
           <div className="stat-row">
             <span className="tag">ต้นฉบับ: {originalSize}</span>
-            <span className="tag">ผลลัพธ์: {resultSize ? bytesToSize(resultSize) : "-"}</span>
+            <span className="tag">
+              ผลลัพธ์: {selectedItem?.outputSize ? bytesToSize(selectedItem.outputSize) : "-"}
+            </span>
           </div>
           <div className="preview">
-            {resultUrl ? (
-              <img src={resultUrl} alt="ไฟล์ที่บีบอัดแล้ว" />
-            ) : previewUrl ? (
-              <img src={previewUrl} alt="ตัวอย่างไฟล์" />
+            {selectedItem?.outputUrl ? (
+              <img src={selectedItem.outputUrl} alt="ไฟล์ที่บีบอัดแล้ว" />
+            ) : selectedItem?.previewUrl ? (
+              <img src={selectedItem.previewUrl} alt="ตัวอย่างไฟล์" />
             ) : (
               "Optimize Preview"
             )}
           </div>
-          {resultUrl ? (
-            <a className="btn secondary" href={resultUrl} download={`zenityx-optimize.${format.toLowerCase()}`}>
+          {selectedItem?.outputUrl ? (
+            <a
+              className="btn secondary"
+              href={selectedItem.outputUrl}
+              download={getOutputName(selectedItem.file, format)}
+            >
               ดาวน์โหลดไฟล์
             </a>
           ) : (
@@ -202,6 +306,9 @@ export default function OptimizePage() {
               ดาวน์โหลดไฟล์
             </button>
           )}
+          <button className="btn secondary" type="button" onClick={handleDownloadAll} disabled={!canDownloadAll}>
+            ดาวน์โหลดทั้งหมด (zip)
+          </button>
         </div>
       </div>
     </PageShell>

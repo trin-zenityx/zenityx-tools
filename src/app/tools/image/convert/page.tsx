@@ -1,9 +1,28 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import PageShell from "@/components/PageShell";
+import JSZip from "jszip";
+import { saveAs } from "file-saver";
+import {
+  bytesToSize,
+  canvasToBlob,
+  fileToImage,
+  isHeicFile
+} from "@/lib/image";
 
 type ConvertFormat = "PNG" | "JPG" | "WEBP";
+
+type ConvertItem = {
+  id: string;
+  file: File;
+  status: "idle" | "working" | "done" | "error";
+  message?: string;
+  outputUrl?: string;
+  outputBlob?: Blob;
+  outputSize?: number;
+  previewUrl?: string;
+};
 
 const formatToMime: Record<ConvertFormat, string> = {
   PNG: "image/png",
@@ -11,94 +30,139 @@ const formatToMime: Record<ConvertFormat, string> = {
   WEBP: "image/webp"
 };
 
-function bytesToSize(bytes: number) {
-  if (!bytes) return "0 KB";
-  const units = ["B", "KB", "MB"];
-  const idx = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  const value = bytes / Math.pow(1024, idx);
-  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[idx]}`;
+function makeId() {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-async function loadImageFromFile(file: File) {
-  const url = URL.createObjectURL(file);
-  try {
-    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const image = new Image();
-      image.onload = () => resolve(image);
-      image.onerror = reject;
-      image.src = url;
-    });
-    return img;
-  } finally {
-    URL.revokeObjectURL(url);
-  }
+function getOutputName(file: File, format: ConvertFormat) {
+  const base = file.name.replace(/\.[^.]+$/, "");
+  return `${base}.${format.toLowerCase()}`;
 }
 
 export default function ConvertPage() {
-  const [file, setFile] = useState<File | null>(null);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [resultUrl, setResultUrl] = useState<string | null>(null);
-  const [resultSize, setResultSize] = useState<number | null>(null);
+  const [items, setItems] = useState<ConvertItem[]>([]);
   const [format, setFormat] = useState<ConvertFormat>("PNG");
   const [quality, setQuality] = useState(88);
   const [status, setStatus] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [isWorking, setIsWorking] = useState(false);
+  const itemsRef = useRef<ConvertItem[]>([]);
+
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
 
   useEffect(() => {
     return () => {
-      if (previewUrl) URL.revokeObjectURL(previewUrl);
-      if (resultUrl) URL.revokeObjectURL(resultUrl);
+      itemsRef.current.forEach((item) => {
+        if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+        if (item.outputUrl) URL.revokeObjectURL(item.outputUrl);
+      });
     };
-  }, [previewUrl, resultUrl]);
+  }, []);
 
-  const originalSize = useMemo(() => (file ? bytesToSize(file.size) : "-") , [file]);
+  const originalSize = useMemo(() => {
+    const file = items.find((item) => item.id === selectedId)?.file;
+    return file ? bytesToSize(file.size) : "-";
+  }, [items, selectedId]);
 
-  const handleFile = (nextFile: File | null) => {
-    setFile(nextFile);
-    setStatus(null);
-    setResultUrl(null);
-    setResultSize(null);
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    if (nextFile) {
-      setPreviewUrl(URL.createObjectURL(nextFile));
-    } else {
-      setPreviewUrl(null);
+  const selectedItem = useMemo(
+    () => items.find((item) => item.id === selectedId) ?? null,
+    [items, selectedId]
+  );
+
+  const handleFiles = (files: FileList | null) => {
+    items.forEach((item) => {
+      if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+      if (item.outputUrl) URL.revokeObjectURL(item.outputUrl);
+    });
+
+    if (!files || files.length === 0) {
+      setItems([]);
+      setSelectedId(null);
+      setStatus(null);
+      return;
     }
+
+    const nextItems: ConvertItem[] = Array.from(files).map((file) => {
+      const previewUrl = !isHeicFile(file) ? URL.createObjectURL(file) : undefined;
+      return {
+        id: makeId(),
+        file,
+        status: "idle",
+        previewUrl
+      };
+    });
+
+    setItems(nextItems);
+    setSelectedId(nextItems[0].id);
+    setStatus(null);
+  };
+
+  const updateItem = (id: string, patch: Partial<ConvertItem>) => {
+    setItems((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
   };
 
   const handleConvert = async () => {
-    if (!file) return;
+    if (items.length === 0) return;
+    setIsWorking(true);
     setStatus("กำลังแปลงไฟล์...");
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-    try {
-      const image = await loadImageFromFile(file);
-      const canvas = document.createElement("canvas");
-      canvas.width = image.width;
-      canvas.height = image.height;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) throw new Error("Canvas ไม่พร้อมใช้งาน");
-      ctx.drawImage(image, 0, 0);
 
-      const mime = formatToMime[format];
-      const q = format === "PNG" ? 1 : quality / 100;
-      const blob = await new Promise<Blob | null>((resolve) =>
-        canvas.toBlob(resolve, mime, q)
-      );
-      if (!blob) throw new Error("ไม่สามารถสร้างไฟล์ใหม่ได้");
+    for (const item of items) {
+      updateItem(item.id, { status: "working", message: "กำลังแปลง" });
+      try {
+        const { image, revoke } = await fileToImage(item.file);
+        const canvas = document.createElement("canvas");
+        canvas.width = image.width;
+        canvas.height = image.height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("Canvas ไม่พร้อมใช้งาน");
+        ctx.drawImage(image, 0, 0);
 
-      if (resultUrl) URL.revokeObjectURL(resultUrl);
-      const url = URL.createObjectURL(blob);
-      setResultUrl(url);
-      setResultSize(blob.size);
-      setStatus("แปลงไฟล์สำเร็จ");
-    } catch {
-      setStatus("เกิดข้อผิดพลาดในการแปลงไฟล์");
+        const mime = formatToMime[format];
+        const q = format === "PNG" ? 1 : quality / 100;
+        const blob = await canvasToBlob(canvas, mime, q);
+        if (!blob) throw new Error("ไม่สามารถสร้างไฟล์ใหม่ได้");
+
+        if (item.outputUrl) URL.revokeObjectURL(item.outputUrl);
+        const url = URL.createObjectURL(blob);
+        updateItem(item.id, {
+          status: "done",
+          message: "เสร็จแล้ว",
+          outputUrl: url,
+          outputBlob: blob,
+          outputSize: blob.size
+        });
+        revoke();
+      } catch {
+        updateItem(item.id, { status: "error", message: "แปลงไม่สำเร็จ" });
+      }
     }
+
+    setStatus("แปลงไฟล์เสร็จแล้ว");
+    setIsWorking(false);
   };
+
+  const handleDownloadAll = async () => {
+    const completed = items.filter((item) => item.outputBlob);
+    if (completed.length === 0) return;
+    const zip = new JSZip();
+    completed.forEach((item) => {
+      if (item.outputBlob) {
+        zip.file(getOutputName(item.file, format), item.outputBlob);
+      }
+    });
+    const blob = await zip.generateAsync({ type: "blob" });
+    saveAs(blob, `zenityx-convert-${Date.now()}.zip`);
+  };
+
+  const canDownloadAll = items.length > 1 && items.every((item) => item.status === "done");
 
   return (
     <PageShell
       title="แปลงไฟล์ภาพ"
-      description="แปลงไฟล์ภาพเป็น PNG, JPG หรือ WEBP โดยตั้งค่าคุณภาพได้ตามต้องการ"
+      description="แปลงไฟล์ภาพเป็น PNG, JPG หรือ WEBP โดยตั้งค่าคุณภาพได้ตามต้องการ (รองรับ HEIC และแบบหลายไฟล์)"
       breadcrumbs={[
         { label: "หน้าแรก", href: "/" },
         { label: "รูปภาพ", href: "/tools/image" },
@@ -112,10 +176,11 @@ export default function ConvertPage() {
             id="file"
             className="input"
             type="file"
-            accept="image/*"
-            onChange={(event) => handleFile(event.target.files?.[0] ?? null)}
+            accept="image/*,.heic,.heif"
+            multiple
+            onChange={(event) => handleFiles(event.target.files)}
           />
-          <span className="helper">รองรับไฟล์ PNG, JPG, WEBP, HEIC</span>
+          <span className="helper">รองรับไฟล์ PNG, JPG, WEBP, HEIC (เลือกหลายไฟล์ได้)</span>
 
           <label htmlFor="format">ฟอร์แมตปลายทาง</label>
           <select
@@ -141,29 +206,61 @@ export default function ConvertPage() {
           />
           <span className="helper">แนะนำ 80-92 สำหรับสมดุลคุณภาพและขนาดไฟล์</span>
 
-          <button className="btn primary" type="button" onClick={handleConvert}>
-            แปลงไฟล์
+          <button className="btn primary" type="button" onClick={handleConvert} disabled={isWorking}>
+            {isWorking ? "กำลังแปลง..." : "แปลงไฟล์"}
           </button>
           {status ? <span className="helper">{status}</span> : null}
         </div>
 
         <div className="form-panel">
+          <h3>ไฟล์ที่เลือก</h3>
+          <div className="list">
+            {items.length === 0 ? (
+              <span className="helper">ยังไม่มีไฟล์</span>
+            ) : (
+              items.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={`list-item ${selectedId === item.id ? "active" : ""}`}
+                  onClick={() => setSelectedId(item.id)}
+                >
+                  <div>
+                    <strong>{item.file.name}</strong>
+                    <div className="helper">{bytesToSize(item.file.size)}</div>
+                  </div>
+                  <span className={`chip ${item.status}`}>{item.message ?? "รอ"}</span>
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="grid" style={{ marginTop: 24 }}>
+        <div className="form-panel">
           <h3>ตัวอย่างผลลัพธ์</h3>
           <div className="stat-row">
             <span className="tag">ไฟล์ต้นฉบับ: {originalSize}</span>
-            <span className="tag">ผลลัพธ์: {resultSize ? bytesToSize(resultSize) : "-"}</span>
+            <span className="tag">
+              ผลลัพธ์: {selectedItem?.outputSize ? bytesToSize(selectedItem.outputSize) : "-"}
+            </span>
           </div>
           <div className="preview">
-            {resultUrl ? (
-              <img src={resultUrl} alt="ไฟล์ที่แปลงแล้ว" />
-            ) : previewUrl ? (
-              <img src={previewUrl} alt="ตัวอย่างไฟล์" />
+            {selectedItem?.outputUrl ? (
+              <img src={selectedItem.outputUrl} alt="ไฟล์ที่แปลงแล้ว" />
+            ) : selectedItem?.previewUrl ? (
+              <img src={selectedItem.previewUrl} alt="ตัวอย่างไฟล์" />
             ) : (
               "Preview Area"
             )}
           </div>
-          {resultUrl ? (
-            <a className="btn secondary" href={resultUrl} download={`zenityx-convert.${format.toLowerCase()}`}>
+          {selectedItem?.outputUrl ? (
+            <a
+              className="btn secondary"
+              href={selectedItem.outputUrl}
+              download={getOutputName(selectedItem.file, format)}
+            >
               ดาวน์โหลดไฟล์
             </a>
           ) : (
@@ -171,6 +268,9 @@ export default function ConvertPage() {
               ดาวน์โหลดไฟล์
             </button>
           )}
+          <button className="btn secondary" type="button" onClick={handleDownloadAll} disabled={!canDownloadAll}>
+            ดาวน์โหลดทั้งหมด (zip)
+          </button>
         </div>
       </div>
     </PageShell>
